@@ -1,1 +1,14 @@
 fastapi[all]
+uvicorn[standard]
+requests
+google-cloud-aiplatform
+google-cloud-speech
+python-dotenv
+line-bot-sdk
+python-multipart
+setuptools
+pytest
+pytest-mock
+httpx
+python-dotenv
+gunicorn
