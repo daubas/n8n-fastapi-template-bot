@@ -5,6 +5,7 @@ import importlib.util
 import sys
 import os
 import logging
+from fastapi import FastAPI  # <--- 添加或確保這一行存在
 from pathlib import Path
 import json
 import base64
