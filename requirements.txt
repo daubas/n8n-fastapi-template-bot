@@ -1,8 +1,7 @@
 fastapi[all]
 uvicorn[standard]
 requests
-google-cloud-aiplatform>=1.38.0
-google-cloud-speech
+xai-grok-sdk
 python-dotenv
 line-bot-sdk
 python-multipart
