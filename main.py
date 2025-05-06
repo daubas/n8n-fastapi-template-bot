@@ -169,45 +169,65 @@ async def generate_text_grok_via_openai(prompt: str) -> str:
 
 
 async def generate_image_grok(prompt: str) -> str:
-    """使用 Grok API 生成圖片 (直接調用 REST API，因 SDK 可能不兼容)"""
-    # --- 這部分的邏輯保持不變，仍然使用 httpx 直接調用 ---
+    """使用配置好的 OpenAI SDK 調用 Grok 圖像生成 API"""
     try:
-        logger.info(f"Calling Grok Image Generation REST API with prompt: {prompt[:100]}...")
-        headers = {"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"}
-        json_payload = {
-            "prompt": prompt,
-            "num_images": 1,
-            "size": "1024x768", # 可調整
-            "response_format": "b64_json" # 請求 Base64
-        }
-        # *** 確認圖像生成的確切 API 端點 ***
-        # 根據你之前的文件，可能是 /image-generate，但 base URL 是 api.x.ai/v1 還是 api.x.ai 需要確認
-        # 假設圖像生成的 base URL 也是 /v1/
-        api_url = "https://api.x.ai/v1/image-generate"
+        logger.info(f"Calling Grok Image Generation via OpenAI SDK with prompt: {prompt[:100]}...")
 
-        async with httpx.AsyncClient() as client:
-             response = await client.post(api_url, headers=headers, json=json_payload, timeout=60.0)
-             response.raise_for_status() # Raises HTTPStatusError for 4xx/5xx
-             data = response.json()
+        # 使用 OpenAI SDK 的 images.generate 方法
+        # 注意：OpenAI SDK v1+ 是同步的，在異步函數中需要用 asyncio.to_thread
+        response = await asyncio.to_thread(
+            openai_client.images.generate,
+            model="grok-2-image-1212",  # <-- 使用文件中提到的目前唯一可用模型，或 "grok-2-image"
+            prompt=prompt,
+            n=1,                      # 生成圖片數量
+            size="1024x1024",         # OpenAI SDK images.generate 常用的尺寸格式，確認 Grok 是否支持
+                                      # Grok 文件之前提到 "1024x768"，你需要確認 Grok 透過此 SDK 接口支持哪些尺寸
+            response_format="url"     # 請求返回圖片 URL，這對 LINE 來說更理想
+                                      # 也可以是 "b64_json" 如果你需要 Base64
+        )
+        logger.info("Grok Image Generation via OpenAI SDK successful.")
 
-        logger.info("Grok Image Generation REST API call successful.")
-        if data.get("data") and data["data"][0].get("b64_json"):
-             base64_image = data["data"][0]["b64_json"]
-             return f"data:image/png;base64,{base64_image}"
+        # 解析 OpenAI SDK 標準的圖像回應結構
+        if response.data and len(response.data) > 0:
+            image_data = response.data[0]
+            if image_data.url:
+                logger.info(f"Grok Image URL: {image_data.url}")
+                return image_data.url
+            elif image_data.b64_json: # 如果請求的是 b64_json
+                logger.info("Grok Image returned Base64 data.")
+                return f"data:image/png;base64,{image_data.b64_json}" # 假設是 PNG
+            else:
+                logger.error("Grok Image response (via OpenAI SDK) missing URL or B64_JSON.")
+                raise fastapi.HTTPException(status_code=500, detail="AI Service (Grok Image) response format error.")
         else:
-             logger.error("Grok Image REST API response format unexpected.")
-             raise fastapi.HTTPException(status_code=500, detail="Grok Image Generation failed (invalid API response).")
+            logger.warning("Grok Image response (via OpenAI SDK) did not contain expected data.")
+            raise fastapi.HTTPException(status_code=500, detail="AI Service (Grok Image) returned no data.")
 
-    except httpx.HTTPStatusError as e:
-         logger.error(f"Error calling Grok Image API (HTTP Error): {e.response.status_code} - {e.response.text}", exc_info=True)
-         detail = f"AI Service (Grok Image) failed with status {e.response.status_code}."
-         try: err_data = e.response.json(); detail += f" Message: {err_data.get('error', {}).get('message', e.response.text)}"
-         except: pass
-         raise fastapi.HTTPException(status_code=e.response.status_code, detail=detail)
-    except Exception as e:
-        logger.error(f"Error calling Grok Image Generation API: {e}", exc_info=True)
-        raise fastapi.HTTPException(status_code=503, detail="AI Service (Grok Image) unavailable or failed.")
-
+    # 捕獲 OpenAI SDK 可能拋出的特定錯誤
+    except openai.APIConnectionError as e:
+        logger.error(f"Grok Image API connection error: {e}", exc_info=True)
+        raise fastapi.HTTPException(status_code=503, detail="AI Service connection error (Grok Image).")
+    except openai.RateLimitError as e:
+        logger.error(f"Grok Image API rate limit exceeded: {e}", exc_info=True)
+        raise fastapi.HTTPException(status_code=429, detail="AI Service rate limit exceeded (Grok Image).")
+    except openai.AuthenticationError as e: # API Key 問題
+        logger.error(f"Grok Image API authentication error: {e}", exc_info=True)
+        raise fastapi.HTTPException(status_code=401, detail="AI Service authentication failed (Grok Image).")
+    except openai.BadRequestError as e: # 例如模型不支持或參數錯誤
+        logger.error(f"Grok Image API bad request (check model/params?): {e}", exc_info=True)
+        detail_msg = "AI Service (Grok Image) bad request."
+        if e.body and "message" in e.body: # OpenAI SDK 錯誤通常在 e.body 中
+            detail_msg += f" Message: {e.body['message']}"
+        raise fastapi.HTTPException(status_code=400, detail=detail_msg)
+    except openai.APIError as e: # 其他 API 層級錯誤 (例如 404 如果模型或端點仍然不對)
+        logger.error(f"Grok Image API returned an error: {e}", exc_info=True)
+        detail_msg = f"AI Service error (Grok Image): {str(e)}"
+        if e.body and "message" in e.body:
+            detail_msg += f" Message: {e.body['message']}"
+        raise fastapi.HTTPException(status_code=e.status_code or 500, detail=detail_msg)
+    except Exception as e: # 捕獲其他未預料的錯誤
+        logger.error(f"Unexpected error calling Grok Image via OpenAI SDK: {e}", exc_info=True)
+        raise fastapi.HTTPException(status_code=500, detail="Internal server error during image generation.")
 # --- 7. FastAPI 應用程式實例與路由 (調用新的文字生成函式) ---
 app = FastAPI(
     title="N8N Dialog Bot Backend (Grok via OpenAI SDK)",
