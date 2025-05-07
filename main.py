@@ -167,38 +167,43 @@ async def generate_text_grok_via_openai(prompt: str) -> str:
         logger.error(f"Unexpected error calling Grok LLM via OpenAI SDK: {e}", exc_info=True)
         raise fastapi.HTTPException(status_code=500, detail="Internal server error during AI processing.")
 
-
+# --- 重寫 generate_image_grok 函式以使用 OpenAI SDK 並移除不支持的參數 ---
 async def generate_image_grok(prompt: str) -> str:
     """使用配置好的 OpenAI SDK 調用 Grok 圖像生成 API"""
     try:
         logger.info(f"Calling Grok Image Generation via OpenAI SDK with prompt: {prompt[:100]}...")
 
         # 使用 OpenAI SDK 的 images.generate 方法
-        # 注意：OpenAI SDK v1+ 是同步的，在異步函數中需要用 asyncio.to_thread
+        # 根據最新官方文件，移除 size 參數，並使用 "grok-2-image" 模型
         response = await asyncio.to_thread(
             openai_client.images.generate,
-            model="grok-2-image-1212",  # <-- 使用文件中提到的目前唯一可用模型，或 "grok-2-image"
+            model="grok-2-image",      # <-- 使用官方文件示例中的模型名
             prompt=prompt,
-            n=1,                      # 生成圖片數量
-            size="1024x1024",         # OpenAI SDK images.generate 常用的尺寸格式，確認 Grok 是否支持
-                                      # Grok 文件之前提到 "1024x768"，你需要確認 Grok 透過此 SDK 接口支持哪些尺寸
-            response_format="url"     # 請求返回圖片 URL，這對 LINE 來說更理想
-                                      # 也可以是 "b64_json" 如果你需要 Base64
+            n=1,                       # 生成一張圖片
+            response_format="b64_json" # <-- 請求 Base64 JSON 以便返回 Data URI
+            # quality, size, style 均不被支持，已移除
         )
         logger.info("Grok Image Generation via OpenAI SDK successful.")
 
         # 解析 OpenAI SDK 標準的圖像回應結構
         if response.data and len(response.data) > 0:
             image_data = response.data[0]
-            if image_data.url:
-                logger.info(f"Grok Image URL: {image_data.url}")
-                return image_data.url
-            elif image_data.b64_json: # 如果請求的是 b64_json
+            # 檢查是否有 revised_prompt 並記錄
+            if hasattr(image_data, 'revised_prompt') and image_data.revised_prompt:
+                logger.info(f"Grok Image revised_prompt: {image_data.revised_prompt}")
+
+            if image_data.b64_json:
                 logger.info("Grok Image returned Base64 data.")
-                return f"data:image/png;base64,{image_data.b64_json}" # 假設是 PNG
+                # Grok 返回的 b64_json 可能直接是 Base64 字串，或像示例中包含 "data:image/png;base64,..."
+                # 根據 OpenAI SDK 的標準，image_data.b64_json 應該是純 Base64 字串
+                # 所以我們需要自己組裝 Data URI
+                return f"data:image/jpeg;base64,{image_data.b64_json}" # 文件說生成的是 jpg，所以用 image/jpeg
+            elif image_data.url: # 以防萬一它仍然返回了 URL
+                logger.info(f"Grok Image URL (unexpected but handling): {image_data.url}")
+                return image_data.url
             else:
-                logger.error("Grok Image response (via OpenAI SDK) missing URL or B64_JSON.")
-                raise fastapi.HTTPException(status_code=500, detail="AI Service (Grok Image) response format error.")
+                logger.error("Grok Image response (via OpenAI SDK) missing b64_json or URL.")
+                raise fastapi.HTTPException(status_code=500, detail="AI Service (Grok Image) response format error (no b64_json or url).")
         else:
             logger.warning("Grok Image response (via OpenAI SDK) did not contain expected data.")
             raise fastapi.HTTPException(status_code=500, detail="AI Service (Grok Image) returned no data.")
@@ -210,24 +215,33 @@ async def generate_image_grok(prompt: str) -> str:
     except openai.RateLimitError as e:
         logger.error(f"Grok Image API rate limit exceeded: {e}", exc_info=True)
         raise fastapi.HTTPException(status_code=429, detail="AI Service rate limit exceeded (Grok Image).")
-    except openai.AuthenticationError as e: # API Key 問題
+    except openai.AuthenticationError as e:
         logger.error(f"Grok Image API authentication error: {e}", exc_info=True)
         raise fastapi.HTTPException(status_code=401, detail="AI Service authentication failed (Grok Image).")
-    except openai.BadRequestError as e: # 例如模型不支持或參數錯誤
-        logger.error(f"Grok Image API bad request (check model/params?): {e}", exc_info=True)
+    except openai.BadRequestError as e:
+        logger.error(f"Grok Image API bad request: {e}", exc_info=True)
         detail_msg = "AI Service (Grok Image) bad request."
-        if e.body and "message" in e.body: # OpenAI SDK 錯誤通常在 e.body 中
-            detail_msg += f" Message: {e.body['message']}"
+        if hasattr(e, 'body') and e.body and isinstance(e.body, dict) and "message" in e.body:
+            grok_error_message = e.body['message']
+            logger.error(f"Grok API detailed error message: {grok_error_message}")
+            detail_msg += f" Message: {grok_error_message}"
+        elif hasattr(e, 'message'):
+             logger.error(f"Grok API error message from e.message: {e.message}")
+             detail_msg += f" Message: {e.message}"
+        else:
+             logger.error(f"Grok API error body was not in expected format or missing: {e.body if hasattr(e, 'body') else 'N/A'}")
         raise fastapi.HTTPException(status_code=400, detail=detail_msg)
-    except openai.APIError as e: # 其他 API 層級錯誤 (例如 404 如果模型或端點仍然不對)
+    except openai.APIError as e:
         logger.error(f"Grok Image API returned an error: {e}", exc_info=True)
         detail_msg = f"AI Service error (Grok Image): {str(e)}"
-        if e.body and "message" in e.body:
+        if hasattr(e, 'body') and e.body and isinstance(e.body, dict) and "message" in e.body:
             detail_msg += f" Message: {e.body['message']}"
         raise fastapi.HTTPException(status_code=e.status_code or 500, detail=detail_msg)
-    except Exception as e: # 捕獲其他未預料的錯誤
+    except Exception as e:
         logger.error(f"Unexpected error calling Grok Image via OpenAI SDK: {e}", exc_info=True)
         raise fastapi.HTTPException(status_code=500, detail="Internal server error during image generation.")
+
+
 # --- 7. FastAPI 應用程式實例與路由 (調用新的文字生成函式) ---
 app = FastAPI(
     title="N8N Dialog Bot Backend (Grok via OpenAI SDK)",
